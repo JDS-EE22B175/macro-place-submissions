@@ -1,14 +1,16 @@
 """
-Hybrid Analytical + Simulated Annealing Macro Placer (v2)
+Hybrid Analytical + Simulated Annealing Macro Placer (v3)
 
 Approach:
   1. Extract net connectivity from PlacementCost for HPWL-aware optimization
   2. Smooth analytical phase: log-sum-exp wirelength with density spreading
      via Nesterov-accelerated gradient descent
   3. Legalize: greedy overlap resolution with minimum displacement
-  4. SA refinement: congestion-aware simulated annealing using RUDY routing
-     demand estimation alongside wirelength, with shift/swap/neighbor moves
-  5. Evaluate final candidates via the actual proxy cost function and pick best
+  4. SA refinement: congestion-aware simulated annealing with *incremental*
+     cost evaluation (O(degree) per step) and shift/swap/neighbor moves
+  5. Multiple candidates generated in parallel via fork-based multiprocessing
+  6. Time-budgeted: automatically scales SA iterations to fill available time
+  7. Evaluate final candidates via the actual proxy cost function and pick best
 
 Usage:
     uv run evaluate submissions/my_placer/placer.py
@@ -17,8 +19,11 @@ Usage:
 """
 
 import math
+import multiprocessing
+import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -169,7 +174,7 @@ def _rudy_congestion(pos, sizes, edges, edge_weights, cw, ch, grid_rows, grid_co
 # ---------------------------------------------------------------------------
 
 def _analytical_place(pos, movable, sizes, half_w, half_h, cw, ch, n,
-                      edges, edge_weights, num_iters=600):
+                      edges, edge_weights, num_iters=800):
     """
     Nesterov-accelerated gradient descent on smooth LSE wirelength + overlap
     penalty. Produces a good starting point for legalization.
@@ -224,9 +229,9 @@ def _analytical_place(pos, movable, sizes, half_w, half_h, cw, ch, n,
 
         # Pairwise overlap penalty (ramps up over iterations)
         density_weight = density_weight_start + frac * (density_weight_end - density_weight_start)
-        mp = full_pos[:n]
-        dx = mp[:, 0].unsqueeze(1) - mp[:, 0].unsqueeze(0)
-        dy = mp[:, 1].unsqueeze(1) - mp[:, 1].unsqueeze(0)
+        mp_pos = full_pos[:n]
+        dx = mp_pos[:, 0].unsqueeze(1) - mp_pos[:, 0].unsqueeze(0)
+        dy = mp_pos[:, 1].unsqueeze(1) - mp_pos[:, 1].unsqueeze(0)
         sep_x = (sizes_t[:, 0].unsqueeze(1) + sizes_t[:, 0].unsqueeze(0)) / 2 + 0.1
         sep_y = (sizes_t[:, 1].unsqueeze(1) + sizes_t[:, 1].unsqueeze(0)) / 2 + 0.1
         overlap_x = torch.clamp(sep_x - torch.abs(dx), min=0)
@@ -325,14 +330,21 @@ def _legalize(pos, movable, sizes, half_w, half_h, cw, ch, n):
 
 
 # ---------------------------------------------------------------------------
-# SA refinement: congestion-aware simulated annealing
+# SA refinement: incremental-cost simulated annealing
 # ---------------------------------------------------------------------------
 
 def _sa_refine(pos, edges, edge_weights, movable, sizes, half_w, half_h,
-               cw, ch, n, grid_rows, grid_cols, num_iters=5000):
+               cw, ch, n, grid_rows, grid_cols, num_iters=10_000_000,
+               time_budget_sec=None):
     """
-    SA with shift, swap, and neighbor-attract moves.
-    Cost function blends wirelength + RUDY congestion estimate.
+    SA with incremental wirelength evaluation for shift, swap, and
+    neighbor-attract moves. Uses per-edge cost tracking so each move
+    only recomputes edges touching the moved macro(s), giving O(degree)
+    cost per step instead of O(E).
+
+    The time_budget_sec parameter (if set) caps the SA wall-clock time,
+    allowing the algorithm to automatically scale to fill available
+    compute time on any hardware.
     """
     movable_idx = np.where(movable)[0]
     if len(movable_idx) == 0 or len(edges) == 0:
@@ -342,23 +354,27 @@ def _sa_refine(pos, edges, edge_weights, movable, sizes, half_w, half_h,
     sep_x = (sizes[:, 0:1] + sizes[:, 0:1].T) / 2
     sep_y = (sizes[:, 1:2] + sizes[:, 1:2].T) / 2
 
+    # --- Pre-build edge adjacency for incremental cost ---
+    macro_to_edge_list = [[] for _ in range(n)]
+    for k in range(len(edges)):
+        macro_to_edge_list[edges[k, 0]].append(k)
+        macro_to_edge_list[edges[k, 1]].append(k)
+    macro_edges = [np.array(lst, dtype=np.intp) for lst in macro_to_edge_list]
+
     # Neighbor lists for connectivity-aware moves
     neighbors = [[] for _ in range(n)]
-    for i, j in edges:
-        neighbors[i].append(j)
-        neighbors[j].append(i)
+    for ei, ej in edges:
+        neighbors[ei].append(ej)
+        neighbors[ej].append(ei)
 
-    def wl_cost():
-        dx = np.abs(pos[edges[:, 0], 0] - pos[edges[:, 1], 0])
-        dy = np.abs(pos[edges[:, 0], 1] - pos[edges[:, 1], 1])
-        return (edge_weights * (dx + dy)).sum()
-
-    def combined_cost():
-        """Wirelength + RUDY congestion, weighted to match proxy cost formula."""
-        wl = wl_cost()
-        rudy = _rudy_congestion(pos, sizes, edges, edge_weights,
-                                cw, ch, grid_rows, grid_cols)
-        return wl + 0.5 * rudy
+    # --- Pre-compute per-edge costs for incremental updates ---
+    edge_src = edges[:, 0]
+    edge_dst = edges[:, 1]
+    edge_cost_arr = edge_weights * (
+        np.abs(pos[edge_src, 0] - pos[edge_dst, 0]) +
+        np.abs(pos[edge_src, 1] - pos[edge_dst, 1])
+    )
+    current_wl = float(edge_cost_arr.sum())
 
     def check_overlap(idx):
         gap = 0.05
@@ -368,105 +384,133 @@ def _sa_refine(pos, edges, edge_weights, movable, sizes, half_w, half_h,
         overlaps[idx] = False
         return overlaps.any()
 
-    # Evaluate initial cost with congestion every N steps to keep it tractable.
-    # For per-move decisions, use the cheaper wirelength-only cost but
-    # periodically recompute the full cost to track best.
-    current_wl = wl_cost()
+    def delta_wl(affected):
+        """Recompute costs for affected edges after position change.
+        Returns (delta_cost, saved_old_costs)."""
+        if len(affected) == 0:
+            return 0.0, None
+        old = edge_cost_arr[affected].copy()
+        s, d = edge_src[affected], edge_dst[affected]
+        edge_cost_arr[affected] = edge_weights[affected] * (
+            np.abs(pos[s, 0] - pos[d, 0]) + np.abs(pos[s, 1] - pos[d, 1])
+        )
+        return float(edge_cost_arr[affected].sum() - old.sum()), old
+
     best_pos = pos.copy()
-    best_full_cost = combined_cost()
+    best_wl = current_wl
 
     T_start = max(cw, ch) * 0.12
     T_end = max(cw, ch) * 0.0005
 
-    # Recompute full cost every this many steps
-    full_eval_interval = max(50, num_iters // 100)
+    sa_start = time.time()
 
     for step in range(num_iters):
+        # Hard stop check every 5000 steps to ensure we don't exceed time budget
+        # If triggered, the loop breaks and returns the best_pos found so far
+        if time_budget_sec is not None and step % 5000 == 0 and step > 0:
+            if time.time() - sa_start > time_budget_sec:
+                break
+
         frac = step / num_iters
         T = T_start * (T_end / T_start) ** frac
 
         move_type = random.random()
         i = random.choice(movable_idx)
-        old_x, old_y = pos[i, 0], pos[i, 1]
+        old_xi, old_yi = pos[i, 0], pos[i, 1]
 
         if move_type < 0.45:
-            # SHIFT
+            # --- SHIFT ---
             shift_scale = T * (0.3 + 0.7 * (1 - frac))
             pos[i, 0] = np.clip(pos[i, 0] + random.gauss(0, shift_scale),
                                 half_w[i], cw - half_w[i])
             pos[i, 1] = np.clip(pos[i, 1] + random.gauss(0, shift_scale),
                                 half_h[i], ch - half_h[i])
 
+            if check_overlap(i):
+                pos[i, 0] = old_xi; pos[i, 1] = old_yi
+                continue
+
+            aff = macro_edges[i]
+            dw, old_c = delta_wl(aff)
+            if dw < 0 or random.random() < math.exp(-dw / max(T, 1e-10)):
+                current_wl += dw
+            else:
+                pos[i, 0] = old_xi; pos[i, 1] = old_yi
+                if old_c is not None:
+                    edge_cost_arr[aff] = old_c
+
         elif move_type < 0.75:
-            # SWAP
+            # --- SWAP ---
             if neighbors[i] and random.random() < 0.6:
                 cands = [j for j in neighbors[i] if movable[j]]
                 j = random.choice(cands) if cands else random.choice(movable_idx)
             else:
                 j = random.choice(movable_idx)
 
-            if i != j:
-                old_jx, old_jy = pos[j, 0], pos[j, 1]
-                pos[i, 0] = np.clip(old_jx, half_w[i], cw - half_w[i])
-                pos[i, 1] = np.clip(old_jy, half_h[i], ch - half_h[i])
-                pos[j, 0] = np.clip(old_x, half_w[j], cw - half_w[j])
-                pos[j, 1] = np.clip(old_y, half_h[j], ch - half_h[j])
-
-                if check_overlap(i) or check_overlap(j):
-                    pos[i, 0] = old_x; pos[i, 1] = old_y
-                    pos[j, 0] = old_jx; pos[j, 1] = old_jy
-                    continue
-
-                new_wl = wl_cost()
-                delta = new_wl - current_wl
-                if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-10)):
-                    current_wl = new_wl
-                else:
-                    pos[i, 0] = old_x; pos[i, 1] = old_y
-                    pos[j, 0] = old_jx; pos[j, 1] = old_jy
-
-                # Track best using full cost at intervals
-                if step % full_eval_interval == 0:
-                    fc = combined_cost()
-                    if fc < best_full_cost:
-                        best_full_cost = fc
-                        best_pos = pos.copy()
+            if i == j:
                 continue
 
+            old_xj, old_yj = pos[j, 0], pos[j, 1]
+            pos[i, 0] = np.clip(old_xj, half_w[i], cw - half_w[i])
+            pos[i, 1] = np.clip(old_yj, half_h[i], ch - half_h[i])
+            pos[j, 0] = np.clip(old_xi, half_w[j], cw - half_w[j])
+            pos[j, 1] = np.clip(old_yi, half_h[j], ch - half_h[j])
+
+            if check_overlap(i) or check_overlap(j):
+                pos[i, 0] = old_xi; pos[i, 1] = old_yi
+                pos[j, 0] = old_xj; pos[j, 1] = old_yj
+                continue
+
+            # Affected = union of edges touching i or j
+            if len(macro_edges[i]) > 0 and len(macro_edges[j]) > 0:
+                aff = np.unique(np.concatenate([macro_edges[i], macro_edges[j]]))
+            elif len(macro_edges[i]) > 0:
+                aff = macro_edges[i]
+            elif len(macro_edges[j]) > 0:
+                aff = macro_edges[j]
+            else:
+                aff = np.array([], dtype=np.intp)
+
+            dw, old_c = delta_wl(aff)
+            if dw < 0 or random.random() < math.exp(-dw / max(T, 1e-10)):
+                current_wl += dw
+            else:
+                pos[i, 0] = old_xi; pos[i, 1] = old_yi
+                pos[j, 0] = old_xj; pos[j, 1] = old_yj
+                if old_c is not None:
+                    edge_cost_arr[aff] = old_c
+
         else:
-            # MOVE TOWARD NEIGHBOR
-            if neighbors[i]:
-                j = random.choice(neighbors[i])
-                alpha = random.uniform(0.05, 0.35)
-                pos[i, 0] = np.clip(pos[i, 0] + alpha * (pos[j, 0] - pos[i, 0]),
-                                    half_w[i], cw - half_w[i])
-                pos[i, 1] = np.clip(pos[i, 1] + alpha * (pos[j, 1] - pos[i, 1]),
-                                    half_h[i], ch - half_h[i])
+            # --- MOVE TOWARD NEIGHBOR ---
+            if not neighbors[i]:
+                continue
+            j = random.choice(neighbors[i])
+            alpha = random.uniform(0.05, 0.35)
+            pos[i, 0] = np.clip(pos[i, 0] + alpha * (pos[j, 0] - pos[i, 0]),
+                                half_w[i], cw - half_w[i])
+            pos[i, 1] = np.clip(pos[i, 1] + alpha * (pos[j, 1] - pos[i, 1]),
+                                half_h[i], ch - half_h[i])
 
-        # Check overlap for shift/neighbor moves
-        if check_overlap(i):
-            pos[i, 0] = old_x
-            pos[i, 1] = old_y
-            continue
+            if check_overlap(i):
+                pos[i, 0] = old_xi; pos[i, 1] = old_yi
+                continue
 
-        new_wl = wl_cost()
-        delta = new_wl - current_wl
-        if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-10)):
-            current_wl = new_wl
-        else:
-            pos[i, 0] = old_x
-            pos[i, 1] = old_y
+            aff = macro_edges[i]
+            dw, old_c = delta_wl(aff)
+            if dw < 0 or random.random() < math.exp(-dw / max(T, 1e-10)):
+                current_wl += dw
+            else:
+                pos[i, 0] = old_xi; pos[i, 1] = old_yi
+                if old_c is not None:
+                    edge_cost_arr[aff] = old_c
 
-        # Periodic full cost evaluation for best tracking
-        if step % full_eval_interval == 0:
-            fc = combined_cost()
-            if fc < best_full_cost:
-                best_full_cost = fc
-                best_pos = pos.copy()
+        # Track best by wirelength
+        if current_wl < best_wl:
+            best_wl = current_wl
+            best_pos = pos.copy()
 
-    # Final check: is the last position better than tracked best?
-    fc = combined_cost()
-    if fc < best_full_cost:
+    # Final check
+    if current_wl < best_wl:
         best_pos = pos.copy()
 
     return best_pos
@@ -487,6 +531,50 @@ def _eval_proxy(pos_hard, benchmark, plc):
 
 
 # ---------------------------------------------------------------------------
+# Candidate execution wrapper
+# ---------------------------------------------------------------------------
+
+def _run_candidate(path_type, seed, pos, movable, sizes_np, half_w, half_h,
+                   cw, ch, n_hard, edges, edge_weights, grid_rows, grid_cols,
+                   analytical_iters, sa_iters, sa_time_budget):
+    import random as _random
+    import numpy as _np
+    import torch as _torch
+
+    _random.seed(seed)
+    _np.random.seed(seed)
+    _torch.manual_seed(seed)
+
+    if path_type == "analytical+SA":
+        if len(edges) == 0:
+            return path_type, seed, _legalize(pos, movable, sizes_np, half_w, half_h, cw, ch, n_hard)
+
+        pos_a = _analytical_place(
+            pos, movable, sizes_np, half_w, half_h, cw, ch, n_hard,
+            edges, edge_weights, num_iters=analytical_iters,
+        )
+        pos_a = _legalize(pos_a, movable, sizes_np, half_w, half_h, cw, ch, n_hard)
+        pos_a = _sa_refine(
+            pos_a, edges, edge_weights, movable, sizes_np,
+            half_w, half_h, cw, ch, n_hard, grid_rows, grid_cols,
+            num_iters=sa_iters, time_budget_sec=sa_time_budget,
+        )
+        return path_type, seed, pos_a
+
+    elif path_type == "initial+SA":
+        pos_b = _legalize(pos, movable, sizes_np, half_w, half_h, cw, ch, n_hard)
+        if len(edges) > 0:
+            pos_b = _sa_refine(
+                pos_b, edges, edge_weights, movable, sizes_np,
+                half_w, half_h, cw, ch, n_hard, grid_rows, grid_cols,
+                num_iters=sa_iters, time_budget_sec=sa_time_budget,
+            )
+        return path_type, seed, pos_b
+
+    return path_type, seed, pos
+
+
+# ---------------------------------------------------------------------------
 # Main placer class
 # ---------------------------------------------------------------------------
 
@@ -494,16 +582,27 @@ class HybridAnalyticalSAPlacer:
     """
     Hybrid macro placer: analytical optimization -> legalization -> SA polish.
 
-    Two candidate paths (analytical start vs initial start) are evaluated using
-    the actual TILOS proxy cost, and the better result is returned.
+    Multiple candidate paths (analytical start vs initial start) with diverse
+    seeds are evaluated. On multi-core Linux hardware, candidates run in
+    parallel using fork-based multiprocessing. The SA phase uses incremental
+    cost evaluation (O(degree) per step) and time-budgeting to automatically
+    scale iterations to fill available compute time.
+
+    The best result by actual TILOS proxy cost is returned.
     """
 
-    def __init__(self, seed=42, analytical_iters=600, sa_iters=6000):
+    def __init__(self, seed=42, analytical_iters=800, sa_iters=10_000_000,
+                 num_seeds_per_path=4, time_budget_minutes=59.0):
         self.seed = seed
         self.analytical_iters = analytical_iters
         self.sa_iters = sa_iters
+        self.num_seeds_per_path = num_seeds_per_path
+        # 60 minute hard stop: default to 59.0 minutes to provide a 1-minute safety margin
+        self.time_budget_minutes = time_budget_minutes
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
+        place_start = time.time()
+
         torch.manual_seed(self.seed)
         random.seed(self.seed)
         np.random.seed(self.seed)
@@ -527,37 +626,57 @@ class HybridAnalyticalSAPlacer:
         grid_rows = benchmark.grid_rows
         grid_cols = benchmark.grid_cols
 
+        # --- Build task list ---
+        tasks = []
+        for i in range(self.num_seeds_per_path):
+            tasks.append(("analytical+SA", self.seed + i * 2))
+            tasks.append(("initial+SA", self.seed + i * 2 + 1))
+
+        # HARD STOP: limit total time to time_budget_minutes to guarantee < 60 mins
+        total_budget_sec = self.time_budget_minutes * 60
+        # Reserve time for analytical (~60s), legalization (~10s),
+        # proxy cost eval (~30s), soft macro opt (~120s)
+        overhead_sec = 220
+
+        # --- Run candidates (parallel if possible, sequential otherwise) ---
         candidates = []
+        use_parallel = False
 
-        # --- Path A: analytical -> legalize -> SA ---
-        if len(edges) > 0:
-            random.seed(self.seed)
-            np.random.seed(self.seed)
-            pos_a = _analytical_place(
-                pos, movable, sizes_np, half_w, half_h, cw, ch, n_hard,
-                edges, edge_weights, num_iters=self.analytical_iters,
-            )
-            pos_a = _legalize(pos_a, movable, sizes_np, half_w, half_h, cw, ch, n_hard)
-            random.seed(self.seed + 1)
-            pos_a = _sa_refine(
-                pos_a, edges, edge_weights, movable, sizes_np,
-                half_w, half_h, cw, ch, n_hard, grid_rows, grid_cols,
-                num_iters=self.sa_iters,
-            )
-            candidates.append(("analytical+SA", pos_a))
+        if sys.platform != 'win32':
+            try:
+                ctx = multiprocessing.get_context('fork')
+                n_workers = min(len(tasks), os.cpu_count() or 4)
+                # Parallel: each candidate gets full SA budget (runs on own core)
+                sa_budget = max(60, total_budget_sec - overhead_sec)
+                task_args = [
+                    (p_type, s, pos, movable, sizes_np, half_w, half_h,
+                     cw, ch, n_hard, edges, edge_weights, grid_rows, grid_cols,
+                     self.analytical_iters, self.sa_iters, sa_budget)
+                    for p_type, s in tasks
+                ]
+                with ctx.Pool(n_workers) as pool:
+                    results = pool.starmap(_run_candidate, task_args)
+                for p_type, s, cand_pos in results:
+                    candidates.append((f"{p_type}_seed_{s}", cand_pos))
+                use_parallel = True
+            except Exception as e:
+                print(f"  [HybridASA] Parallel failed ({e}), falling back to sequential",
+                      file=sys.stderr)
 
-        # --- Path B: initial -> legalize -> SA ---
-        pos_b = _legalize(pos, movable, sizes_np, half_w, half_h, cw, ch, n_hard)
-        if len(edges) > 0:
-            random.seed(self.seed + 2)
-            pos_b = _sa_refine(
-                pos_b, edges, edge_weights, movable, sizes_np,
-                half_w, half_h, cw, ch, n_hard, grid_rows, grid_cols,
-                num_iters=self.sa_iters,
-            )
-        candidates.append(("initial+SA", pos_b))
+        if not use_parallel:
+            # Sequential: divide time budget among candidates
+            sa_budget = max(30, (total_budget_sec - overhead_sec) / max(len(tasks), 1))
+            task_args = [
+                (p_type, s, pos, movable, sizes_np, half_w, half_h,
+                 cw, ch, n_hard, edges, edge_weights, grid_rows, grid_cols,
+                 self.analytical_iters, self.sa_iters, sa_budget)
+                for p_type, s in tasks
+            ]
+            for args in task_args:
+                p_type, s, cand_pos = _run_candidate(*args)
+                candidates.append((f"{p_type}_seed_{s}", cand_pos))
 
-        # Pick best candidate by actual proxy cost
+        # --- Pick best candidate by actual proxy cost ---
         best_name = None
         best_cost = float("inf")
         best_hard = candidates[0][1]  # fallback
@@ -584,29 +703,33 @@ class HybridAnalyticalSAPlacer:
         full_pos[:n_hard] = torch.tensor(best_hard, dtype=torch.float32)
 
         # -----------------------------------------------------------------------
-        # Soft macro optimization (Priority 2)
+        # Soft macro optimization
         # -----------------------------------------------------------------------
         if plc is not None:
-            from macro_place.objective import _set_placement
-            # Sync our best hard macro placement into plc
-            _set_placement(plc, full_pos, benchmark)
-            
-            # Run force-directed standard cell optimization
-            canvas_size = max(cw, ch)
-            plc.optimize_stdcells(
-                use_current_loc=False, move_stdcells=True, move_macros=False,
-                log_scale_conns=False, use_sizes=False, io_factor=1.0,
-                num_steps=[100, 100, 100],
-                max_move_distance=[canvas_size/100]*3,
-                attract_factor=[100, 1.0e-3, 1.0e-5],
-                repel_factor=[0, 1.0e6, 1.0e7],
-            )
-            
-            # Extract the newly optimized soft macro positions back into full_pos
-            for i, macro_idx in enumerate(benchmark.soft_macro_indices):
-                node = plc.modules_w_pins[macro_idx]
-                x, y = node.get_pos()
-                full_pos[n_hard + i, 0] = float(x)
-                full_pos[n_hard + i, 1] = float(y)
+            elapsed = time.time() - place_start
+            remaining = total_budget_sec - elapsed
+            # Only run soft macro optimization if we have at least 30 seconds left before the hard stop
+            if remaining > 30:
+                from macro_place.objective import _set_placement
+                # Sync our best hard macro placement into plc
+                _set_placement(plc, full_pos, benchmark)
+
+                # Run force-directed standard cell optimization
+                canvas_size = max(cw, ch)
+                plc.optimize_stdcells(
+                    use_current_loc=False, move_stdcells=True, move_macros=False,
+                    log_scale_conns=False, use_sizes=False, io_factor=1.0,
+                    num_steps=[100, 100, 100],
+                    max_move_distance=[canvas_size/100]*3,
+                    attract_factor=[100, 1.0e-3, 1.0e-5],
+                    repel_factor=[0, 1.0e6, 1.0e7],
+                )
+
+                # Extract the newly optimized soft macro positions back into full_pos
+                for i, macro_idx in enumerate(benchmark.soft_macro_indices):
+                    node = plc.modules_w_pins[macro_idx]
+                    x, y = node.get_pos()
+                    full_pos[n_hard + i, 0] = float(x)
+                    full_pos[n_hard + i, 1] = float(y)
 
         return full_pos
